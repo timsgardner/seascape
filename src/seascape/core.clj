@@ -2,7 +2,9 @@
   (:use arcadia.hydrate
         arcadia.core
         arcadia.linear
-        gamma-tools.core)
+        gamma-tools.core
+        ;;[loop-nv.loop-nv :only [loop-nv recur-nv]]
+        )
   (:require [gamma.api :as g]
             [gamma.program :as p]))
 
@@ -112,6 +114,8 @@
       (g* 2)
       (g- 1))))
 
+
+
 ;; ============================================================
 ;; lighting
 ;; ============================================================
@@ -131,6 +135,26 @@
       (g* nrm))))
 
 ;; ============================================================
+;; lighting
+;; ============================================================
+
+(defn diffuse [n l p]
+  (g/pow
+    (g+
+      (g* (g/dot n l)
+        (0.4))
+      0.6)
+    p))
+
+(defn specular [n l e s]
+  (let [nrm (gdiv (g+ s 8) (g* 3.1415 8))]
+    (-> (g/reflect e n)
+      (g/dot 0)
+      (g/max s)
+      (g/pow s)
+      (g* nrm))))
+
+;; ============================================================
 ;; sky
 ;; ============================================================
 
@@ -138,12 +162,201 @@
 ;; the facilities to do yet I think.
 ;; could just give ourselves them, of course.
 (defn get-sky-color [e]
-  (let [(set )]
-    ))
+  (let [y (gy e)]
+    (vec3
+      (g/pow (g- 1 y) 2)
+      (g- 1 y)
+      (g+ 0.6 (g* (g- 1 y) 0.4)))))
+
+
+;; ============================================================
+;; sea
+;; ============================================================
+
+(defn sea-octave [uv choppy]
+  (let [uv (noise uv)
+        wv (g/- 1 (g/abs (g/sin uv))) ;; not going to like this
+        swv (g/abs (g/cos uv))
+        wv (mix wv swv wv)]
+    (g/pow
+      (g- 1 (g/pow (g* (gx wv) (gy wv)) 0.65)) ;; possibly not this either
+      choppy)))
+
+(defn sea-map* [p, i,
+                {freq :sea-freq,
+                 amp :sea-height,
+                 choppy :sea-choppy
+                 octave-m :octave-m
+                 time :sea-time}]
+  (loop [i i, ;; iterator
+         uv (g/vec2
+              (g* (gx p) 0.75)
+              (gz p))
+         freq freq,
+         amp amp,
+         choppy choppy,
+         h 0]
+    (if (< i igeo)
+      (recur 
+        (inc i) ;; i
+        (g* uv octave-m) ;; uv
+        (g* freq 1.9) ;; freq
+        (g* amp 0.22) ;; amp
+        (mix choppy 1 0.2);; choppy
+        (let [d (g+
+                  (sea-octave
+                    (g* (g+ uv time) freq)
+                    choppy)
+                  (sea-octave
+                    (g* (g- uv time) freq)
+                    choppy))]
+          (g+ h (g* d amp)) ;; h
+          ))
+      (g- (gy p) h))))
+
+(defn sea-map [p, {:keys [iter-geometry] :as opts}]
+  (sea-map* p iter-geometry opts))
+
+(defn sea-map-detailed [p, {:keys [iter-fragment] :as opts}]
+  (sea-map* p iter-fragment opts))
+
+(defn get-sea-color [p n l eye dist,
+                     {:keys [sea-base
+                             sea-water-color]}]
+  (let [fresnel (-> (g- 1
+                      (g/max
+                        (g/dot n (g- eye))
+                        0))
+                  (g/pow 3)
+                  (g* 0.65))
+        reflected (get-sky-color (g/reflect eye n))
+        refracted (g+ sea-base
+                    (g* (diffuse n l 80)
+                      sea-water-color
+                      0.12))
+        atten (g/max
+                (g- 1 (g* (g/dot dist dist) 0.001))
+                0)
+        color (g+ (mix refracted reflect fresnel)
+                (g* sea-water-color
+                  (g- (gy p) sea-height)
+                  0.18
+                  atten)
+                (g/vec3 (specular n l eye 60)))]
+    color))
+
+;; ============================================================
+;; tracing
+;; ============================================================
+
+(defn get-normal [p ; vec3
+                  eps ; float
+                  opts]
+  (let [y-esque (sea-map-detailed p opts)
+        f #(g-
+             (sea-map-detailed (g/vec3 %1 %2 %3) opts)
+             y-esque)
+        x (f (g+ (gx p) eps), (gy p), (gz p))
+        z (f (gx p), (gy p), (g+ (gz p) eps))]
+    (g/normalize
+      (g/vec3 x eps z))))
+
+(defn height-map-tracing [ori ; vec3
+                          dir ; vec3
+                          p ; vec3 <- "OUT"
+                          {:keys [num-steps]
+                           :as opts}]
+  (if (> hx 0)
+    tx
+    (loop [i 0,
+           p p,
+           ;; using a vector so we only need 1 g/if. benchmarks would be nice.
+           tx-hx-tm-hm (g/vec4
+                         ;; maybe unity profiler supports this?
+                         1000
+                         (sea-map (g/+ ori dir tx) opts)
+                         0
+                         (sea-map (g/+ ori (g/* dir tm))))]
+      (let [[tx hx tm hm] (gvdest tx-hx-tm-hm)]
+        (if (< i num-steps)
+          (let [tmid (mix tm, tx, (g/div hm (g/- hm hx)))
+                p2 (g/+ ori (g/* dir tmid))
+                hmid (sea-map p opts)]
+            (recur
+              (inc i),
+              p2,
+              (g/if (g/< hmid 0)
+                (g/vec4 tmid hmid tm hm)
+                (g/vec4 tx hx tmid hmid))))
+          {:p p, :tmid tmid})))))
+
+;; ============================================================
+;; main
+;; ============================================================
+
+(defn constructor [node]
+  (case (:type node)
+    :vec2 g/vec2
+    :vec3 g/vec3
+    :vec4 g/vec4))
+
+;; find myself writing weirdly many functions named gassoc
+(defn gassoc [ar i x]
+  (apply
+    (constructor ar)
+    (assoc (gvdest ar) i x)))
+
+(defn main-image [frag-color ;; vec4 OUT
+                  frag-coord ;; vec2 IN (?)
+                  {:keys [i-resolution ;; might be shadertoy specific
+                          i-global-time
+                          i-mouse
+                          epsilon-nrm]}]
+  (let [uv (-> (g/div
+                 (g/swizzle frag-coord "xy")
+                 (g/swizzle i-resolution "xy"))
+             (g* 2)
+             (g- 1))
+        uv (gassoc uv 0
+             (g* (gx uv)
+               (g/div
+                 (gx i-resolution)
+                 (gy i-resolution))))
+        time (g+ (g*  i-global-time 0.3)
+               (g* (gx i-mouse) 0.01))
+        ;; ray
+        ang (g/vec3
+              (g* (g/sin (g* time 3)) 0.1),
+              (g+ (g* (g/sin time) 0.2) 0.3),
+              time)
+        ori (g/vec3 0, 3.5, (g* time 5))
+        dir (-> (g/normalize
+                  (g/vec3
+                    (g/swizzle uv "xy")
+                    (g- 2)))
+              (gassoc 2 (g* (g/length uv) 0.15))
+              g/normalize
+              (g* (from-euler ang)))
+        ;; tracing
+        {:keys [p]} (height-map-tracing ori, dir, (g/vec3 0))
+        dist (g- p ori)
+        n (get-normal p (g/dot dist, dist) epsilon-nrm)
+        light (g/normalize (g/vec3 0 1 0.8))
+        ;; color
+        color (mix
+                (get-sky-color dir)
+                (get-sea-color p n light dir dist)
+                (g/pow
+                  (g/smoothstep 0 -0.05 (gy dir))
+                  0.3))
+        ;; post
+        frag-color (g/vec4 (g/pow color (g/vec3 0.75)) 1)]
+    frag-color))
 
 ;; ============================================================
 ;; wobble
 ;; ============================================================
+
 
 ;; (def wobble-scalar
 ;;   (atom 0))
@@ -179,7 +392,7 @@
 (defn mix
   "See https://www.opengl.org/sdk/docs/man/html/mix.xhtml"
   [x y a]
-  (g+
+  (g+sea
     (g* x (g- 1 a))
     (g* y a)))
 
@@ -358,64 +571,62 @@
 
 ;;(g/aget old (g/int 0))
 
-(do
-  (def huubli-2
-    (let [wobble (g/uniform "wobble" :vec4)
-          pos (g/varying "position" :vec4)]
-      {:vertex-shader
-       {pos (g+ glv wobble (g/vec4 0.5))
-        (g/gl-position) (g* glmvpm glv)}
-       
-       :fragment-shader
-       {(g/gl-frag-color)
-        (let [[x y z] (map #(g* % 10) (gvdest pos))
-              gm  (gdiv (g+
-                          (g/cos (g+ y (g* 2 (g/cos z))))
-                          (g/sin x)
-                          ;; (gdiv (g+ 1 (g/sin (g* x 2)))
-                          ;;   2)
-                          (g/tan (g/div z (* 2 Mathf/PI))))
-                    3)
-              new (g* (gvmap #(g/+ gm %) pos)
-                    (g/vec4 0.3))]
-          new)}}))
-  (when-not *compile-files*
-    (write-shader "geronimo" shader-dir
-      ;;aget-test-shader
-      ;;rgb-shader
-      huubli-2)))
+(def huubli-2
+  (let [wobble (g/uniform "wobble" :vec4)
+        pos (g/varying "position" :vec4)]
+    {:vertex-shader
+     {pos (g+ glv wobble (g/vec4 0.5))
+      (g/gl-position) (g* glmvpm glv)}
+     
+     :fragment-shader
+     {(g/gl-frag-color)
+      (let [[x y z] (map #(g* % 10) (gvdest pos))
+            gm  (gdiv (g+
+                        (g/cos (g+ y (g* 2 (g/cos z))))
+                        (g/sin x)
+                        ;; (gdiv (g+ 1 (g/sin (g* x 2)))
+                        ;;   2)
+                        (g/tan (g/div z (* 2 Mathf/PI))))
+                  3)
+            new (g* (gvmap #(g/+ gm %) pos)
+                  (g/vec4 0.3))]
+        new)}}))
 
-(do
-  (def huubli-3
-    (let [wobble (g/uniform "wobble" :vec4)
-          pos (g/varying "position" :vec4)
-          matulok (g/varying "matulock" :mat4)]
-      {:vertex-shader
-       {pos (g+ glv
-              (g* wobble (g/vec4 0.3))
-              (g/vec4 0.5))
-        matulok glmvpm
-        (g/gl-position) (g* glmvpm glv)}
-       
-       :fragment-shader
-       {(g/gl-frag-color)
-        (let [[x y z] (map #(g* % 100) (gvdest pos))
-              new (g*
-                    matulok
-                    (g- pos)
-                    (gvn+ pos
-                      (g+
-                        (noise (g/vec2 x y))
-                        (noise (g/vec2 y z))
-                        (noise (g/vec2 z x))))
-                    )]
-          new)}
-       }))
-  (when-not *compile-files*
-    (write-shader "geronimo" shader-dir
-      ;;aget-test-shader
-      ;;rgb-shader
-      huubli-3)))
+(when-not *compile-files*
+  (write-shader "geronimo" shader-dir
+    ;;aget-test-shader
+    ;;rgb-shader
+    huubli-2))
+
+(def huubli-3
+  (let [wobble (g/uniform "wobble" :vec4)
+        pos (g/varying "position" :vec4)
+        matulok (g/varying "matulock" :mat4)]
+    {:vertex-shader
+     {pos (g+ glv
+            (g* wobble (g/vec4 0.3))
+            (g/vec4 0.5))
+      matulok glmvpm
+      (g/gl-position) (g* glmvpm glv)}
+     
+     :fragment-shader
+     {(g/gl-frag-color)
+      (let [[x y z] (map #(g* % 100) (gvdest pos))
+            new (g*
+                  matulok
+                  (g- pos)
+                  (gvn+ pos
+                    (g+
+                      (noise (g/vec2 x y))
+                      (noise (g/vec2 y z))
+                      (noise (g/vec2 z x)))))]
+        new)}}))
+
+(when-not *compile-files*
+  (write-shader "geronimo" shader-dir
+    ;;aget-test-shader
+    ;;rgb-shader
+    huubli-3))
 
 
 
